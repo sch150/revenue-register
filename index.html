@@ -1338,22 +1338,24 @@ function exportDebtorsCsv(list, label){
   list.forEach(c=>rows.push([c.name, branchName(c.branchId), c.department, c.contact, c.balance, debtorBalance(c.id), c.notes]));
   downloadCsv(rows, `debtors-${(label||'export').toString().replace(/\s+/g,'-')}.csv`);
 }
+function normalizeHeader(s){ return String(s).trim().toLowerCase().replace(/[_\-]+/g,' ').replace(/\s+/g,' '); }
 function pickField(row, names){
   const keys = Object.keys(row||{});
   for(const want of names){
-    const key = keys.find(k=> k.trim().toLowerCase() === want.toLowerCase());
-    if(key !== undefined && row[key] !== undefined) return row[key];
+    const wantNorm = normalizeHeader(want);
+    const key = keys.find(k=> normalizeHeader(k) === wantNorm);
+    if(key !== undefined && row[key] !== undefined && row[key] !== '') return row[key];
   }
   return '';
 }
 function buildDebtorRow(r){
   return {
-    name: String(pickField(r,['name','Name','debtor','Debtor','customer','Customer'])||'').trim(),
-    contact: String(pickField(r,['contact','Contact','phone','Phone','tel','Tel'])||'').trim(),
-    branch: String(pickField(r,['branch','Branch','location','Location','office','Office'])||'').trim(),
-    department: String(pickField(r,['department','Department','dept','Dept'])||'').trim(),
-    balance: parseMoney(pickField(r,['balance','Balance','opening balance','Opening Balance','outstanding','Outstanding','outstanding balance','Outstanding Balance','amount','Amount','amount owed','Amount Owed','debt','Debt'])),
-    notes: String(pickField(r,['notes','Notes','note','Note'])||'').trim(),
+    name: String(pickField(r,['name','debtor','customer','debtor name','customer name'])||'').trim(),
+    contact: String(pickField(r,['contact','phone','tel','telephone','phone number'])||'').trim(),
+    branch: String(pickField(r,['branch','location','office','branch name'])||'').trim(),
+    department: String(pickField(r,['department','dept'])||'').trim(),
+    balance: parseMoney(pickField(r,['balance','opening balance','current balance','outstanding','outstanding balance','amount','amount owed','debt','balance due'])),
+    notes: String(pickField(r,['notes','note','remarks','comment','comments'])||'').trim(),
   };
 }
 function importDebtorsFile(input){
