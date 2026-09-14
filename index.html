@@ -452,6 +452,7 @@ let ui = {
   customerSearch: '',
   debtorsView: { branchId:null, department:null },
   chequesFilter: { mode:'weekly', date:todayStr(), from:'', to:'', onlyUnpresented:true, branchId:'', department:'' },
+  selectedBranchIds: [],
 };
 
 function visibleTabs(){
@@ -1635,22 +1636,58 @@ function removeCoaEntry(key,id){
 
 /* ================= BRANCHES (admin) ================= */
 function tabBranches(){
+  const sel = ui.selectedBranchIds;
+  const allSelected = state.branches.length>0 && state.branches.every(b=>sel.includes(b.id));
   return `
     <div class="topbar"><div><h1>Branches</h1><div class="subtitle">Office locations used across the register, debtors, cheques and deposits</div></div>
-      <div class="topbar-actions"><button class="btn btn-primary" onclick="openBranchModal()">+ Add branch</button></div>
+      <div class="topbar-actions">
+        ${sel.length? `<button class="btn btn-danger btn-sm" onclick="bulkDeleteSelectedBranches()">Delete selected (${sel.length})</button>`:''}
+        <button class="btn btn-primary" onclick="openBranchModal()">+ Add branch</button>
+      </div>
     </div>
     <div class="card card-flush">
-      <table><thead><tr><th>Name</th><th>Code</th><th class="right">Debtors</th><th class="right">Register entries</th><th></th></tr></thead>
+      <table><thead><tr>
+        <th style="width:36px;"><input type="checkbox" ${allSelected?'checked':''} onchange="toggleSelectAllBranches(this.checked)"></th>
+        <th>Name</th><th>Code</th><th class="right">Debtors</th><th class="right">Register entries</th><th></th>
+      </tr></thead>
       <tbody>
-      ${state.branches.map(b=>`<tr>
+      ${state.branches.length? state.branches.map(b=>`<tr>
+        <td><input type="checkbox" ${sel.includes(b.id)?'checked':''} onchange="toggleBranchSelect('${b.id}')"></td>
         <td>${esc(b.name)}</td><td class="mono-sm">${esc(b.code)}</td>
         <td class="right num">${state.customers.filter(c=>c.branchId===b.id).length}</td>
         <td class="right num">${state.entries.filter(e=>e.branchId===b.id).length}</td>
         <td class="right"><button class="icon-btn" onclick="openBranchModal('${b.id}')">✎</button><button class="icon-btn" onclick="deleteBranch('${b.id}')">✕</button></td>
-      </tr>`).join('')}
+      </tr>`).join('') : `<tr><td colspan="6" class="empty">No branches yet.</td></tr>`}
       </tbody></table>
     </div>
+    ${sel.length? `<p class="section-intro">Branches with debtors, register entries, or assigned users are skipped when bulk-deleting — reassign or clear their data first, or delete them individually after cleaning up.</p>`:''}
   `;
+}
+function toggleBranchSelect(id){
+  const i = ui.selectedBranchIds.indexOf(id);
+  if(i>=0) ui.selectedBranchIds.splice(i,1); else ui.selectedBranchIds.push(id);
+  render();
+}
+function toggleSelectAllBranches(checked){
+  ui.selectedBranchIds = checked ? state.branches.map(b=>b.id) : [];
+  render();
+}
+function branchInUse(id){
+  return state.entries.some(e=>e.branchId===id) || state.customers.some(c=>c.branchId===id) || state.users.some(u=>u.branchId===id);
+}
+function bulkDeleteSelectedBranches(){
+  const ids = ui.selectedBranchIds.slice();
+  if(!ids.length){ toast('Select at least one branch first','err'); return; }
+  const blocked = ids.filter(branchInUse);
+  const deletable = ids.filter(id=>!branchInUse(id));
+  if(!deletable.length){ toast('All selected branches have debtors, entries, or users tied to them','err'); return; }
+  if(deletable.length >= state.branches.length){ toast('At least one branch must remain — deselect one to keep','err'); return; }
+  const names = deletable.map(branchName).join(', ');
+  const warn = blocked.length ? ` (${blocked.length} selected branch${blocked.length>1?'es':''} skipped — has data or users tied to it)` : '';
+  if(!confirm(`Delete ${deletable.length} branch${deletable.length>1?'es':''}: ${names}?${warn}`)) return;
+  mutate(s=>{ s.branches = s.branches.filter(b=>!deletable.includes(b.id)); });
+  ui.selectedBranchIds = ui.selectedBranchIds.filter(id=>!deletable.includes(id));
+  toast(`Deleted ${deletable.length} branch${deletable.length>1?'es':''}${blocked.length? `, skipped ${blocked.length}`:''}`, 'ok');
 }
 function openBranchModal(id){
   const b = id? state.branches.find(x=>x.id===id):null;
@@ -1668,11 +1705,11 @@ function saveBranchFromModal(){
   closeModal(); toast('Branch saved','ok');
 }
 function deleteBranch(id){
-  const inUse = state.entries.some(e=>e.branchId===id) || state.customers.some(c=>c.branchId===id) || state.users.some(u=>u.branchId===id);
-  if(inUse){ toast('This branch has data or users tied to it — reassign or remove those first','err'); return; }
+  if(branchInUse(id)){ toast('This branch has data or users tied to it — reassign or remove those first','err'); return; }
   if(state.branches.length<=1){ toast('At least one branch is required','err'); return; }
   if(!confirm('Delete this branch?')) return;
   mutate(s=>{ s.branches = s.branches.filter(b=>b.id!==id); });
+  ui.selectedBranchIds = ui.selectedBranchIds.filter(x=>x!==id);
 }
 
 /* ================= USERS (admin) ================= */
