@@ -715,6 +715,25 @@ function tabForbidden(){
 }
 
 /* ================= DASHBOARD ================= */
+const LEGACY_NEGATIVE_TYPES = ['direct_transfer_receipt','payment_on_account_momo','payment_on_account_pos'];
+function legacyPositivePaymentEntries(){
+  return state.entries.filter(e=>LEGACY_NEGATIVE_TYPES.includes(e.lineType) && (e.cash>0));
+}
+function repairLegacyPaymentSigns(){
+  const bad = legacyPositivePaymentEntries();
+  if(!bad.length){ toast('No legacy entries found — nothing to fix','ok'); return; }
+  if(!confirm(`This will flip ${bad.length} existing "Payment on account — Transfer/Momo/POS" line(s) from positive to negative, correcting daily balances that were recorded before the sign fix. Export a backup first if you'd like an undo option. Continue?`)) return;
+  mutate(s=>{
+    s.entries.forEach(e=>{
+      if(LEGACY_NEGATIVE_TYPES.includes(e.lineType) && e.cash>0){
+        e.cash = -Math.abs(e.cash);
+        if(e.cheque>0) e.cheque = -Math.abs(e.cheque);
+      }
+    });
+  });
+  toast(`Fixed ${bad.length} line${bad.length>1?'s':''} — balances now reflect the correction`,'ok');
+}
+
 function tabDashboard(){
   const admin = isAdmin();
   const branchId = activeBranchId();
@@ -740,6 +759,12 @@ function tabDashboard(){
       <span>💾 ${daysSince===null? "You haven't taken a local backup yet." : `It's been ${daysSince} day${daysSince===1?'':'s'} since your last local backup.`} Keep a copy on your computer for reliability.</span>
       <button class="btn btn-gold btn-sm" onclick="exportJsonBackup()">Back up now</button>
     </div>` : '';
+  const legacyCount = legacyPositivePaymentEntries().length;
+  const legacyBanner = (isAdmin() && legacyCount>0) ? `
+    <div class="banner" style="background:rgba(247,108,108,.1); border-color:rgba(247,108,108,.3); color:#c23a3a;">
+      <span>⚠ ${legacyCount} "Payment on account — Transfer/Momo/POS" line${legacyCount>1?'s were':' was'} recorded before the balance-sign fix, and still add${legacyCount>1?'':'s'} to the balance instead of reducing it. Recommended: back up first, then run the one-time fix.</span>
+      <button class="btn btn-gold btn-sm" onclick="repairLegacyPaymentSigns()">Fix now</button>
+    </div>` : '';
 
   const branchRows = admin ? state.branches.map(b=>{
     const l = computeLedger(b.id);
@@ -756,6 +781,7 @@ function tabDashboard(){
       </div>
     </div>
     ${backupBanner}
+    ${legacyBanner}
 
     <div class="grid grid-4" style="margin-bottom:6px;">
       <div class="card stat"><div class="label">Balance on hand</div><div class="value count-target" data-final="${closeToday}">0.00</div><div class="sub">Cash + cheques not yet deposited</div></div>
@@ -2130,6 +2156,21 @@ function tabSettings(){
       </div>
       ${state.meta.lastSyncedAt? `<div class="hint" style="margin-top:8px;">Last synced: ${new Date(state.meta.lastSyncedAt).toLocaleString()}</div>` : ''}
     </div>
+
+    ${isAdmin()? `
+    <div class="card">
+      <h3>Data repairs</h3>
+      <p class="section-intro" style="margin-bottom:10px;">One-time fixes for data recorded before a correction was made to the app.</p>
+      <div class="field-row" style="align-items:center;">
+        <div>
+          <div style="font-weight:600;">Legacy Transfer/Momo/POS payment signs</div>
+          <div class="hint">${legacyPositivePaymentEntries().length>0
+            ? `${legacyPositivePaymentEntries().length} line(s) were recorded before the balance-sign fix and still add to the balance instead of reducing it.`
+            : 'No affected lines found — nothing to fix.'}</div>
+        </div>
+        <button class="btn ${legacyPositivePaymentEntries().length>0?'btn-gold':'btn-outline'} btn-sm" ${legacyPositivePaymentEntries().length>0?'':'disabled'} onclick="repairLegacyPaymentSigns()">Run fix</button>
+      </div>
+    </div>` : ''}
 
     <div class="card">
       <h3>Deploy this app</h3>
