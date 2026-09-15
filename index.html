@@ -8,6 +8,10 @@
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  if(window.pdfjsLib){ pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; }
+</script>
 <style>
 :root{
   --bg:#f4efe6;
@@ -326,10 +330,19 @@ const LINE_TYPES = [
   {id:'momo_deduction', short:'Momo −', label:'Momo Deduction', sign:-1, needsDept:true, cashLabel:'Momo amount', chequeLabel:null},
   {id:'pos_deduction', short:'POS −', label:'POS Deduction', sign:-1, needsDept:true, cashLabel:'POS amount', chequeLabel:null},
   {id:'transfer_deduction', short:'Transfer −', label:'Direct Transfer Deduction', sign:-1, needsDept:true, cashLabel:'Transfer amount', chequeLabel:null},
-  {id:'payment_on_account', short:'Payment on a/c', label:'Payment on Account', sign:1, needsCustomer:true, cashLabel:'Cash/momo', chequeLabel:'Cheque'},
-  {id:'direct_transfer_receipt', short:'Transfer in', label:'Direct Transfer (customer payment)', sign:1, needsCustomer:true, cashLabel:'Amount received', chequeLabel:null},
+  {id:'payment_on_account', short:'Pmt on a/c · Cash', label:'Payment on Account — cash or cheque received', sign:1, needsCustomer:true, cashLabel:'Cash received', chequeLabel:'Cheque'},
+  {id:'payment_on_account_momo', short:'Pmt on a/c · Momo −', label:'Payment on Account — momo received', sign:-1, needsCustomer:true, cashLabel:'Momo amount', chequeLabel:null},
+  {id:'payment_on_account_pos', short:'Pmt on a/c · POS −', label:'Payment on Account — POS received', sign:-1, needsCustomer:true, cashLabel:'POS amount', chequeLabel:null},
+  {id:'direct_transfer_receipt', short:'Pmt on a/c · Transfer −', label:'Payment on Account — direct transfer received', sign:-1, needsCustomer:true, cashLabel:'Transfer amount', chequeLabel:null},
   {id:'other', short:'Other', label:'Other (manual +/-)', sign:1, cashLabel:'Cash amount', chequeLabel:'Cheque amount'},
 ];
+const PAYMENT_LINE_TYPES = ['payment_on_account','payment_on_account_momo','payment_on_account_pos','direct_transfer_receipt'];
+const PAYMENT_TYPE_LABELS = {
+  payment_on_account:'Payment on account (cash/cheque)',
+  payment_on_account_momo:'Payment on account (momo)',
+  payment_on_account_pos:'Payment on account (POS)',
+  direct_transfer_receipt:'Payment on account (transfer)',
+};
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 function todayStr(){ return new Date().toISOString().slice(0,10); }
@@ -388,6 +401,7 @@ function defaultState(){
     debtorAdjustments: [],
     deposits: [],
     momoConfirmations: [],
+    bankStatementLines: [],
   };
 }
 
@@ -417,6 +431,9 @@ function loadState(){
   (s.deposits||[]).forEach(d=>{ if(!d.branchId) d.branchId = firstBranch; });
   (s.momoConfirmations||[]).forEach(m=>{ if(!m.branchId) m.branchId = firstBranch; });
   if(!s.debtorAdjustments) s.debtorAdjustments = [];
+  if(!s.bankStatementLines) s.bankStatementLines = [];
+  (s.deposits||[]).forEach(d=>{ if(d.bankConfirmed===undefined) d.bankConfirmed=false; if(d.bankConfirmedDate===undefined) d.bankConfirmedDate=null; });
+  (s.entries||[]).forEach(e=>{ (e.chequeDetails||[]).forEach(cd=>{ if(cd.dishonoured===undefined) cd.dishonoured=false; }); });
   if(!s.users) s.users = [];
   if(!s.users.length && s.meta && s.meta.pin){
     s.users.push({id:uid(), name:'Admin', role:'admin', branchId:null, pin:s.meta.pin});
@@ -476,12 +493,14 @@ function visibleTabs(){
       {id:'register', label:'Daily Register', icon:'▤'},
       {id:'debtors', label:'Debtors', icon:'◍'},
       {id:'cheques', label:'Cheques Register', icon:'🖹'},
+      {id:'closure', label:'Daily Closure Report', icon:'▥'},
       {id:'departments', label:'Departments', icon:'▣'},
     ]},
   ];
   if(admin){
     tabs.push({group:'Admin / Reviewer', items:[
       {id:'deposits', label:'Deposit Confirmations', icon:'◈'},
+      {id:'reconciliation', label:'Bank Reconciliation', icon:'⇄'},
       {id:'momo', label:'Mobile Money Confirmations', icon:'◎'},
       {id:'coa', label:'Chart of Accounts', icon:'▧'},
       {id:'branches', label:'Branches', icon:'⌂'},
@@ -511,10 +530,10 @@ function groupByDate(list){
 }
 function computeLedger(branchId){
   const days = groupByDate(sortedEntries(branchId));
-  let running = 0;
   const result = [];
   for(const day of days){
-    const openBalance = running;
+    let running = 0; // daily closure: each day starts fresh, no carry-forward
+    const openBalance = 0;
     let cashTotal=0, chequeTotal=0;
     const rows = day.rows.map(e=>{
       running += (e.cash||0) + (e.cheque||0);
@@ -680,7 +699,9 @@ function renderTab(){
     case 'departments': return tabDepartments();
     case 'debtors': return tabDebtors();
     case 'cheques': return tabCheques();
+    case 'closure': return tabClosure();
     case 'deposits': return isAdmin() ? tabDeposits() : tabForbidden();
+    case 'reconciliation': return isAdmin() ? tabReconciliation() : tabForbidden();
     case 'momo': return isAdmin() ? tabMomo() : tabForbidden();
     case 'coa': return isAdmin() ? tabCoa() : tabForbidden();
     case 'branches': return isAdmin() ? tabBranches() : tabForbidden();
@@ -800,7 +821,7 @@ function tabRegister(){
   const ledger = computeLedger(branchId).slice().reverse();
   return `
     <div class="topbar">
-      <div><h1>Daily Register</h1><div class="subtitle">${esc(branchName(branchId))} · Type a line, hit <kbd>Enter</kbd>, keep going</div></div>
+      <div><h1>Daily Register</h1><div class="subtitle">${esc(branchName(branchId))} · Type a line, hit <kbd>Enter</kbd>, keep going · balance closes and resets each day</div></div>
       <div class="topbar-actions">
         ${isAdmin()? branchSwitcherHTML() : ''}
         <button class="btn btn-outline" onclick="exportRegisterCsv()">Export CSV</button>
@@ -836,7 +857,7 @@ function tabRegister(){
 function gridHeaderRow(){
   return `<tr>
     <th style="width:34px;">#</th><th>Date</th><th>Type</th><th>Department / customer</th>
-    <th class="right">Cash</th><th class="right">Cheque</th><th class="right">Balance</th><th>Note</th><th></th>
+    <th class="right">Cash</th><th class="right">Cheque</th><th class="right">Day total</th><th>Note</th><th></th>
   </tr>`;
 }
 function draftEntryObject(){
@@ -1035,8 +1056,8 @@ function deleteEntry(id){
 function renderDayBlock(day, branchId){
   const dm = state.dayMeta[dayMetaKey(branchId,day.date)] || {};
   let html = `<tr class="day-head-row">
-    <td></td><td>${fmtDate(day.date)}</td><td colspan="2">Balance brought forward</td>
-    <td class="right num"></td><td class="right num"></td><td class="right num">${money(day.openBalance)}</td><td></td><td></td>
+    <td></td><td>${fmtDate(day.date)}</td><td colspan="2">Day opens — daily closure (balance resets each day)</td>
+    <td class="right num"></td><td class="right num"></td><td class="right num">0.00</td><td></td><td></td>
   </tr>`;
   day.rows.forEach((r,i)=>{
     if(r.id === ui.editingEntryId){ html += entryRowEditor(r, {mode:'edit'}); return; }
@@ -1065,7 +1086,7 @@ function setDayMeta(branchId, date, key, val){
 }
 function exportRegisterCsv(){
   const branchId = activeBranchId();
-  const rows = [['Date','Type','Department','Customer','Cash','Cheque','Note','RunningBalance']];
+  const rows = [['Date','Type','Department','Customer','Cash','Cheque','Note','DayRunningTotal']];
   computeLedger(branchId).forEach(day=>{
     day.rows.forEach(r=>{ rows.push([r.date, r.lineType, r.department||'', r.customer||'', r.cash, r.cheque, r.note||'', r.balance]); });
   });
@@ -1177,9 +1198,9 @@ function computeDebtorLedger(customerId){
   const c = state.customers.find(x=>x.id===customerId);
   if(!c) return {movements:[], balance:0};
   const movements = [{date:c.createdAt||'', type:'Opening balance', ref:'', amount:parseMoney(c.balance)}];
-  state.entries.filter(e=>e.customerId===customerId && (e.lineType==='payment_on_account'||e.lineType==='direct_transfer_receipt')).forEach(e=>{
+  state.entries.filter(e=>e.customerId===customerId && PAYMENT_LINE_TYPES.includes(e.lineType)).forEach(e=>{
     const amt = Math.abs(e.cash||0)+Math.abs(e.cheque||0);
-    movements.push({date:e.date, type: e.lineType==='payment_on_account'?'Payment on account':'Direct transfer payment', ref:e.note||'', amount:-amt});
+    movements.push({date:e.date, type: PAYMENT_TYPE_LABELS[e.lineType]||'Payment on account', ref:e.note||'', amount:-amt});
   });
   state.debtorAdjustments.filter(a=>a.customerId===customerId).forEach(a=>{
     movements.push({date:a.date, type:'Adjustment'+(a.note? ' — '+a.note:''), ref:'', amount: a.type==='increase'? Math.abs(a.amount) : -Math.abs(a.amount)});
@@ -1447,6 +1468,7 @@ function tabCheques(){
   if(f.onlyUnpresented) rows = rows.filter(r=>!r.presented);
   rows.sort((a,b)=> a.dueDate<b.dueDate? -1:1);
   const total = rows.reduce((s,r)=>s+(parseFloat(r.amount)||0),0);
+  const dishonouredRows = rows.filter(r=>r.dishonoured);
   const today = todayStr();
 
   return `
@@ -1473,38 +1495,42 @@ function tabCheques(){
         <div class="field check-field" style="align-self:center;"><input type="checkbox" ${f.onlyUnpresented?'checked':''} onchange="ui.chequesFilter.onlyUnpresented=this.checked; render();"><label>Only not yet presented</label></div>
       </div>
     </div>
-    <div class="grid grid-3" style="margin-bottom:6px;">
+    <div class="grid grid-4" style="margin-bottom:6px;">
       <div class="card stat"><div class="label">Cheques in window</div><div class="value">${rows.length}</div></div>
       <div class="card stat"><div class="label">Total amount</div><div class="value">${money(total)}</div></div>
-      <div class="card stat"><div class="label">Overdue (not presented)</div><div class="value" style="color:var(--red);">${rows.filter(r=>r.dueDate<today && !r.presented).length}</div></div>
+      <div class="card stat"><div class="label">Overdue (not presented)</div><div class="value" style="color:var(--red);">${rows.filter(r=>r.dueDate<today && !r.presented && !r.dishonoured).length}</div></div>
+      <div class="card stat"><div class="label">Dishonoured</div><div class="value" style="color:var(--red);">${dishonouredRows.length} <span class="muted" style="font-size:12px;">(${money(dishonouredRows.reduce((s,r)=>s+(parseFloat(r.amount)||0),0))})</span></div></div>
     </div>
     <div class="card card-flush">
       <div class="table-wrap"><table>
-        <thead><tr><th>Due date</th><th>Status</th><th>Drawer</th><th>Bank</th><th>Cheque no.</th><th>Department</th>${admin?'<th>Branch</th>':''}<th class="right">Amount</th><th>Receipt date</th><th>Presented</th></tr></thead>
+        <thead><tr><th>Due date</th><th>Status</th><th>Drawer</th><th>Bank</th><th>Cheque no.</th><th>Department</th>${admin?'<th>Branch</th>':''}<th class="right">Amount</th><th>Receipt date</th><th>Presented</th><th>Dishonoured</th></tr></thead>
         <tbody>
         ${rows.length? rows.map(r=>{
-          const status = r.presented? '<span class="pill pill-green">Presented</span>' : (r.dueDate<today? '<span class="pill pill-red">Overdue</span>' : '<span class="pill pill-amber">Pending</span>');
+          const status = r.dishonoured? '<span class="pill pill-red">Dishonoured</span>' : (r.presented? '<span class="pill pill-green">Presented</span>' : (r.dueDate<today? '<span class="pill pill-red">Overdue</span>' : '<span class="pill pill-amber">Pending</span>'));
           return `<tr>
             <td class="mono-sm">${fmtDate(r.dueDate)}</td><td>${status}</td>
             <td>${esc(r.customerName||'—')}</td><td>${esc(r.bank||'—')}</td><td class="mono-sm">${esc(r.chequeNumber||'—')}</td>
             <td>${r.department? deptTag(r.department):'<span class="muted">—</span>'}</td>
             ${admin?`<td>${esc(branchName(r.branchId))}</td>`:''}
             <td class="right num">${money(r.amount)}</td><td class="mono-sm">${fmtDate(r.receiptDate||r.entryDate)}</td>
-            <td><input type="checkbox" ${r.presented?'checked':''} onchange="toggleChequePresented('${r.entryId}','${r.id}')"></td>
+            <td><input type="checkbox" ${r.presented?'checked':''} onchange="toggleChequeFlag('${r.entryId}','${r.id}','presented')"></td>
+            <td><input type="checkbox" ${r.dishonoured?'checked':''} onchange="toggleChequeFlag('${r.entryId}','${r.id}','dishonoured')"></td>
           </tr>`;
-        }).join('') : `<tr><td colspan="10" class="empty">No cheques match this filter.</td></tr>`}
+        }).join('') : `<tr><td colspan="${admin?11:10}" class="empty">No cheques match this filter.</td></tr>`}
         </tbody>
       </table></div>
     </div>
   `;
 }
 function setChequesMode(mode){ ui.chequesFilter.mode = mode; render(); }
-function toggleChequePresented(entryId, chequeId){
+function toggleChequeFlag(entryId, chequeId, field){
   mutate(s=>{
     const e = s.entries.find(x=>x.id===entryId);
     if(!e) return;
     const cd = (e.chequeDetails||[]).find(c=>c.id===chequeId);
-    if(cd) cd.presented = !cd.presented;
+    if(!cd) return;
+    cd[field] = !cd[field];
+    if(field==='dishonoured' && cd.dishonoured) cd.presented = false;
   });
 }
 function exportChequesCsv(){
@@ -1514,9 +1540,278 @@ function exportChequesCsv(){
   let rows = allChequeRows().filter(r=> (!scopeBranch || r.branchId===scopeBranch) && (!f.department || r.department===f.department) && chequeMatchesFilter(r.dueDate));
   if(f.onlyUnpresented) rows = rows.filter(r=>!r.presented);
   rows.sort((a,b)=> a.dueDate<b.dueDate? -1:1);
-  const out = [['DueDate','ReceiptDate','Drawer','Bank','ChequeNumber','Amount','Department','Branch','Presented']];
-  rows.forEach(r=>out.push([r.dueDate, r.receiptDate||r.entryDate, r.customerName, r.bank, r.chequeNumber, r.amount, r.department, branchName(r.branchId), r.presented?'Yes':'No']));
+  const out = [['DueDate','ReceiptDate','Drawer','Bank','ChequeNumber','Amount','Department','Branch','Presented','Dishonoured']];
+  rows.forEach(r=>out.push([r.dueDate, r.receiptDate||r.entryDate, r.customerName, r.bank, r.chequeNumber, r.amount, r.department, branchName(r.branchId), r.presented?'Yes':'No', r.dishonoured?'Yes':'No']));
   downloadCsv(out, `cheques-${f.mode}-${todayStr()}.csv`);
+}
+
+/* ================= DAILY CLOSURE REPORT ================= */
+function tabClosure(){
+  const admin = isAdmin();
+  const branchId = admin ? (ui.closureFilter?.branchId || activeBranchId()) : activeBranchId();
+  const from = ui.closureFilter?.from || '';
+  const to = ui.closureFilter?.to || '';
+  const ledger = computeLedger(branchId).filter(d=> (!from || d.date>=from) && (!to || d.date<=to)).reverse();
+  const chequesAll = allChequeRows().filter(r=>r.branchId===branchId);
+  const depositsAll = state.deposits.filter(d=>d.branchId===branchId);
+
+  const rows = ledger.map(day=>{
+    const dm = state.dayMeta[dayMetaKey(branchId,day.date)] || {};
+    const dayCheques = chequesAll.filter(c=> (c.receiptDate||c.entryDate)===day.date);
+    const dayDeposits = depositsAll.filter(d=>d.date===day.date);
+    const dishonoured = dayCheques.filter(c=>c.dishonoured).length;
+    const bankConfirmed = dayDeposits.filter(d=>d.bankConfirmed).length;
+    return {day, dm, dayCheques, dayDeposits, dishonoured, bankConfirmed};
+  });
+
+  return `
+    <div class="topbar">
+      <div><h1>Daily Closure Report</h1><div class="subtitle">${esc(branchName(branchId))} · cash and cheques collected per day, with deposit and cheque confirmation status. Each day closes independently — nothing carries forward.</div></div>
+      <div class="topbar-actions">
+        ${admin? branchSwitcherClosureHTML(branchId) : ''}
+        <button class="btn btn-outline" onclick="exportClosureCsv()">Export CSV</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="field-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:180px;"><label>From</label><input type="date" value="${from}" onchange="ui.closureFilter=Object.assign(ui.closureFilter||{},{from:this.value}); render();"></div>
+        <div class="field" style="max-width:180px;"><label>To</label><input type="date" value="${to}" onchange="ui.closureFilter=Object.assign(ui.closureFilter||{},{to:this.value}); render();"></div>
+      </div>
+    </div>
+    <div class="card card-flush">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th class="right">Cash collected</th><th class="right">Cheques collected</th><th class="right">Day total</th><th>Recorded by</th><th>Signed off</th><th>Deposits logged</th><th>Cheques received</th></tr></thead>
+        <tbody>
+        ${rows.length? rows.map(r=>`
+          <tr>
+            <td>${fmtDate(r.day.date)}</td>
+            <td class="right num">${money(r.day.cashTotal)}</td>
+            <td class="right num">${money(r.day.chequeTotal)}</td>
+            <td class="right num" style="font-weight:600;">${money(r.day.closeBalance)}</td>
+            <td>${esc(r.dm.recordedBy||'—')}</td>
+            <td>${r.dm.signed? '<span class="pill pill-green">Signed</span>':'<span class="pill pill-amber">Pending</span>'}</td>
+            <td>${r.dayDeposits.length? `${r.dayDeposits.length} logged · ${r.bankConfirmed} credited` : '<span class="muted">None</span>'}</td>
+            <td>${r.dayCheques.length? `${r.dayCheques.length} received${r.dishonoured? ` · <span style="color:var(--red);">${r.dishonoured} dishonoured</span>`:''}` : '<span class="muted">None</span>'}</td>
+          </tr>
+        `).join('') : `<tr><td colspan="8" class="empty">No register activity in this range.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>
+  `;
+}
+function branchSwitcherClosureHTML(current){
+  return `<select class="grid-input" style="width:auto;" onchange="ui.closureFilter=Object.assign(ui.closureFilter||{},{branchId:this.value}); render();">
+    ${state.branches.map(b=>`<option value="${b.id}" ${b.id===current?'selected':''}>${esc(b.name)}</option>`).join('')}
+  </select>`;
+}
+function exportClosureCsv(){
+  const branchId = isAdmin() ? (ui.closureFilter?.branchId || activeBranchId()) : activeBranchId();
+  const from = ui.closureFilter?.from || '';
+  const to = ui.closureFilter?.to || '';
+  const ledger = computeLedger(branchId).filter(d=> (!from || d.date>=from) && (!to || d.date<=to));
+  const chequesAll = allChequeRows().filter(r=>r.branchId===branchId);
+  const depositsAll = state.deposits.filter(d=>d.branchId===branchId);
+  const out = [['Date','CashCollected','ChequesCollected','DayTotal','RecordedBy','SignedOff','DepositsLogged','DepositsCredited','ChequesReceived','ChequesDishonoured']];
+  ledger.forEach(day=>{
+    const dm = state.dayMeta[dayMetaKey(branchId,day.date)] || {};
+    const dayCheques = chequesAll.filter(c=> (c.receiptDate||c.entryDate)===day.date);
+    const dayDeposits = depositsAll.filter(d=>d.date===day.date);
+    out.push([day.date, day.cashTotal, day.chequeTotal, day.closeBalance, dm.recordedBy||'', dm.signed?'Yes':'No', dayDeposits.length, dayDeposits.filter(d=>d.bankConfirmed).length, dayCheques.length, dayCheques.filter(c=>c.dishonoured).length]);
+  });
+  downloadCsv(out, `daily-closure-${branchName(branchId).replace(/\s+/g,'-')}.csv`);
+}
+
+/* ================= BANK RECONCILIATION (admin) ================= */
+function tabReconciliation(){
+  const bankId = ui.reconBankId || state.coa.banks[0]?.id || '';
+  const lines = state.bankStatementLines.filter(l=>l.bankId===bankId).sort((a,b)=> a.date<b.date?1:-1);
+  const unconfirmedDeposits = state.deposits.filter(d=>d.bankId===bankId && !d.bankConfirmed);
+
+  return `
+    <div class="topbar">
+      <div><h1>Bank Reconciliation</h1><div class="subtitle">Upload a bank statement to match against deposits logged in the app</div></div>
+    </div>
+    <div class="card">
+      <div class="field"><label>Bank account</label>
+        <select onchange="ui.reconBankId=this.value; render();" style="max-width:420px;">
+          ${state.coa.banks.map(b=>`<option value="${b.id}" ${b.id===bankId?'selected':''}>${esc(b.name)} (${b.code})</option>`).join('')}
+        </select>
+      </div>
+      <div class="field-row" style="margin-top:10px;">
+        <label class="btn btn-primary" style="position:relative; overflow:hidden;">Upload statement (CSV / Excel)<input type="file" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;" onchange="importBankStatement(this, '${bankId}')"></label>
+        <label class="btn btn-outline" style="position:relative; overflow:hidden;">Upload statement (PDF)<input type="file" accept=".pdf" style="position:absolute; inset:0; opacity:0; cursor:pointer;" onchange="importBankStatementPdf(this, '${bankId}')"></label>
+      </div>
+      <p class="section-intro" style="margin:12px 0 0 0;">CSV/Excel statements are read automatically — matching columns for date, description and amount (or separate debit/credit columns) by name. PDF statements vary too much between banks to parse reliably, so a PDF upload extracts the raw text for you to read, and you add matching lines manually below with the "+ Add line from PDF" button — still faster than switching to a separate PDF viewer.</p>
+    </div>
+    ${ui.reconPdfText? `
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;"><h3>Extracted PDF text</h3><button class="icon-btn" onclick="ui.reconPdfText=null; render();">✕ Close</button></div>
+      <div class="table-wrap" style="max-height:240px; overflow-y:auto; background:var(--surface-2); border-radius:var(--radius-sm); padding:12px;"><pre style="white-space:pre-wrap; font-family:'IBM Plex Mono',monospace; font-size:12px; margin:0;">${esc(ui.reconPdfText)}</pre></div>
+      <button class="btn btn-outline btn-sm" style="margin-top:10px;" onclick="openManualStatementLineModal('${bankId}')">+ Add line from PDF</button>
+    </div>` : ''}
+
+    <div class="card card-flush">
+      <div style="padding:14px 18px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="margin:0;">Statement lines</h3>
+        <button class="btn btn-outline btn-sm" onclick="openManualStatementLineModal('${bankId}')">+ Add line manually</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Description</th><th class="right">Amount</th><th>Match</th><th></th></tr></thead>
+        <tbody>
+        ${lines.length? lines.map(l=>{
+          const matched = l.matchedDepositId ? state.deposits.find(d=>d.id===l.matchedDepositId) : null;
+          const suggestion = !matched ? suggestDepositMatch(l) : null;
+          return `<tr>
+            <td class="mono-sm">${fmtDate(l.date)}</td><td>${esc(l.description||'—')}</td><td class="right num">${money(l.amount)}</td>
+            <td>
+              ${matched
+                ? `<span class="pill pill-green">Matched · ${fmtDate(matched.date)} ${money(matched.amount)}</span> <button class="icon-btn" onclick="unmatchStatementLine('${l.id}')" title="Undo match">✕</button>`
+                : `<select onchange="matchStatementLine('${l.id}', this.value)" style="max-width:260px;">
+                    <option value="">— choose a deposit —</option>
+                    ${unconfirmedDeposits.map(d=>`<option value="${d.id}" ${suggestion && suggestion.id===d.id?'selected':''}>${fmtDate(d.date)} · ${money(d.amount)} · ${esc(d.staff)}</option>`).join('')}
+                  </select>${suggestion? ' <span class="pill pill-amber">Suggested</span>':''}`}
+            </td>
+            <td class="right"><button class="icon-btn" onclick="deleteStatementLine('${l.id}')">✕</button></td>
+          </tr>`;
+        }).join('') : `<tr><td colspan="5" class="empty">No statement lines uploaded yet for this bank account.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>
+
+    <div class="card">
+      <h3>Deposits still unmatched for this account</h3>
+      ${unconfirmedDeposits.length? `<table><thead><tr><th>Date</th><th class="right">Amount</th><th>Staff</th><th>Branch</th></tr></thead><tbody>
+        ${unconfirmedDeposits.map(d=>`<tr><td>${fmtDate(d.date)}</td><td class="right num">${money(d.amount)}</td><td>${esc(d.staff)}</td><td>${esc(branchName(d.branchId))}</td></tr>`).join('')}
+      </tbody></table>` : `<p class="section-intro" style="margin:0;">Every logged deposit for this account is matched to a statement line. Nice and clean.</p>`}
+    </div>
+  `;
+}
+function suggestDepositMatch(line){
+  const candidates = state.deposits.filter(d=>d.bankId===line.bankId && !d.bankConfirmed);
+  let best = null, bestDiff = Infinity;
+  candidates.forEach(d=>{
+    const amtDiff = Math.abs((parseFloat(d.amount)||0) - (parseFloat(line.amount)||0));
+    if(amtDiff > 0.01) return;
+    const dayDiff = Math.abs((new Date(d.date) - new Date(line.date)) / 86400000);
+    if(dayDiff <= 5 && dayDiff < bestDiff){ bestDiff = dayDiff; best = d; }
+  });
+  return best;
+}
+function buildStatementRow(r, bankId){
+  const amountRaw = pickField(r,['amount','credit','deposit','credit amount','paid in']);
+  return {
+    id: uid(), bankId,
+    date: (function(){
+      const raw = pickField(r,['date','transaction date','value date','posting date']);
+      if(!raw) return '';
+      if(raw instanceof Date) return raw.toISOString().slice(0,10);
+      const s = String(raw).trim();
+      const d = new Date(s);
+      if(!isNaN(d)) return d.toISOString().slice(0,10);
+      return s;
+    })(),
+    description: String(pickField(r,['description','narration','details','particulars','memo'])||'').trim(),
+    amount: parseMoney(amountRaw),
+    matchedDepositId: null,
+  };
+}
+function importBankStatement(input, bankId){
+  const file = input.files[0];
+  if(!file) return;
+  const finish = rows=>{
+    const clean = rows.filter(r=>r.amount>0 && r.date);
+    if(!clean.length){ toast('No credit/deposit lines with a date and amount were found','err'); return; }
+    mutate(s=>{ s.bankStatementLines = s.bankStatementLines.concat(clean); });
+    toast(`Imported ${clean.length} statement line(s)`,'ok');
+    input.value='';
+  };
+  const name = file.name.toLowerCase();
+  if(name.endsWith('.xlsx') || name.endsWith('.xls')){
+    const reader = new FileReader();
+    reader.onload = evt=>{
+      try{
+        const wb = XLSX.read(evt.target.result, {type:'array'});
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json(sheet, {defval:''});
+        finish(json.map(r=>buildStatementRow(r, bankId)));
+      }catch(e){ toast('Could not read Excel file: '+e.message,'err'); }
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    Papa.parse(file, {header:true, skipEmptyLines:true, complete: res=>{
+      finish(res.data.map(r=>buildStatementRow(r, bankId)));
+    }, error: err=>toast('CSV import failed: '+err.message,'err')});
+  }
+}
+async function importBankStatementPdf(input, bankId){
+  const file = input.files[0];
+  if(!file) return;
+  if(!window.pdfjsLib){ toast('PDF reader failed to load — try a CSV/Excel export instead','err'); return; }
+  try{
+    toast('Reading PDF…');
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({data:buf}).promise;
+    let text = '';
+    for(let i=1;i<=pdf.numPages;i++){
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map(it=>it.str).join(' ') + '\n\n';
+    }
+    ui.reconPdfText = text.trim() || '(No readable text found in this PDF — it may be a scanned image.)';
+    ui.reconBankId = bankId;
+    render();
+    toast('PDF text extracted','ok');
+  }catch(e){
+    toast('Could not read PDF: '+e.message,'err');
+  }
+  input.value='';
+}
+function openManualStatementLineModal(bankId){
+  openModalOnly({type:'manualStatementLine', bankId});
+}
+function saveManualStatementLine(bankId){
+  const date = document.getElementById('mslDate').value;
+  const description = document.getElementById('mslDesc').value.trim();
+  const amount = parseMoney(document.getElementById('mslAmount').value);
+  if(!date || !amount){ toast('Date and amount are required','err'); return; }
+  mutate(s=>{ s.bankStatementLines.push({id:uid(), bankId, date, description, amount, matchedDepositId:null}); });
+  closeModal();
+  toast('Statement line added','ok');
+}
+function matchStatementLine(lineId, depositId){
+  if(!depositId) return;
+  mutate(s=>{
+    const line = s.bankStatementLines.find(l=>l.id===lineId);
+    const dep = s.deposits.find(d=>d.id===depositId);
+    if(!line || !dep) return;
+    line.matchedDepositId = depositId;
+    dep.bankConfirmed = true;
+    dep.bankConfirmedDate = line.date;
+    dep.statementLineId = lineId;
+  });
+  toast('Matched — deposit marked as credited on bank statement','ok');
+}
+function unmatchStatementLine(lineId){
+  mutate(s=>{
+    const line = s.bankStatementLines.find(l=>l.id===lineId);
+    if(!line) return;
+    if(line.matchedDepositId){
+      const dep = s.deposits.find(d=>d.id===line.matchedDepositId);
+      if(dep){ dep.bankConfirmed=false; dep.bankConfirmedDate=null; dep.statementLineId=null; }
+    }
+    line.matchedDepositId = null;
+  });
+}
+function deleteStatementLine(id){
+  if(!confirm('Delete this statement line?')) return;
+  mutate(s=>{
+    const line = s.bankStatementLines.find(l=>l.id===id);
+    if(line && line.matchedDepositId){
+      const dep = s.deposits.find(d=>d.id===line.matchedDepositId);
+      if(dep){ dep.bankConfirmed=false; dep.bankConfirmedDate=null; dep.statementLineId=null; }
+    }
+    s.bankStatementLines = s.bankStatementLines.filter(l=>l.id!==id);
+  });
 }
 
 /* ================= DEPOSITS (admin) ================= */
@@ -1525,11 +1820,11 @@ function tabDeposits(){
   return `
     <div class="topbar">
       <div><h1>Deposit Confirmations</h1><div class="subtitle">Admin/Reviewer record of cash and cheques physically banked</div></div>
-      <div class="topbar-actions"><button class="btn btn-primary" onclick="openDepositModal()">+ Log deposit</button></div>
+      <div class="topbar-actions"><button class="btn btn-outline" onclick="goTab('reconciliation')">Bank Reconciliation →</button><button class="btn btn-primary" onclick="openDepositModal()">+ Log deposit</button></div>
     </div>
     <div class="card card-flush">
       <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Branch</th><th>Bank account</th><th>Type</th><th class="right">Amount</th><th>Deposited by</th><th>Reference</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Date</th><th>Branch</th><th>Bank account</th><th>Type</th><th class="right">Amount</th><th>Deposited by</th><th>Reference</th><th>Verified</th><th>Bank statement</th><th></th></tr></thead>
         <tbody>
         ${list.length? list.map(d=>{
           const bank = state.coa.banks.find(b=>b.id===d.bankId);
@@ -1539,9 +1834,10 @@ function tabDeposits(){
             <td>${esc(d.type)}</td><td class="right num">${money(d.amount)}</td><td>${esc(d.staff)}</td>
             <td class="muted">${esc(d.reference||'—')}</td>
             <td>${d.verified? '<span class="pill pill-green">Verified</span>' : '<span class="pill pill-amber">Pending</span>'}</td>
+            <td>${d.bankConfirmed? '<span class="pill pill-green">Credited</span>' : '<span class="pill pill-blue">Not yet matched</span>'}</td>
             <td class="right"><button class="icon-btn" onclick="openDepositModal('${d.id}')">✎</button><button class="icon-btn" onclick="deleteDeposit('${d.id}')">✕</button></td>
           </tr>`;
-        }).join('') : `<tr><td colspan="9" class="empty">No deposits logged yet.</td></tr>`}
+        }).join('') : `<tr><td colspan="10" class="empty">No deposits logged yet.</td></tr>`}
         </tbody>
       </table></div>
     </div>
@@ -1549,7 +1845,7 @@ function tabDeposits(){
 }
 function openDepositModal(id){
   const d = id? state.deposits.find(x=>x.id===id): null;
-  ui.modal = {type:'deposit', data: d? Object.assign({},d) : {id:null, date:todayStr(), branchId:activeBranchId(), bankId: state.coa.banks[0]?.id||'', type:'Cash', amount:'', staff:'', reference:'', notes:'', verified:false}};
+  ui.modal = {type:'deposit', data: d? Object.assign({},d) : {id:null, date:todayStr(), branchId:activeBranchId(), bankId: state.coa.banks[0]?.id||'', type:'Cash', amount:'', staff:'', reference:'', notes:'', verified:false, bankConfirmed:false, bankConfirmedDate:null}};
   render();
 }
 function saveDepositFromModal(){
@@ -1560,6 +1856,7 @@ function saveDepositFromModal(){
     id: d.id||uid(), date:f.date.value, branchId:f.branchId.value, bankId:f.bankId.value, type:f.type.value,
     amount: parseFloat(f.amount.value)||0, staff:f.staff.value.trim(),
     reference:f.reference.value.trim(), notes:f.notes.value.trim(), verified:f.verified.checked,
+    bankConfirmed: d.bankConfirmed||false, bankConfirmedDate: d.bankConfirmedDate||null, statementLineId: d.statementLineId||null,
   };
   mutate(s=>{
     if(d.id){ s.deposits = s.deposits.map(x=>x.id===d.id? payload : x); }
@@ -1882,6 +2179,9 @@ function loadStateMigrate(s){
   (s.deposits||[]).forEach(d=>{ if(!d.branchId) d.branchId=firstBranch; });
   (s.momoConfirmations||[]).forEach(m=>{ if(!m.branchId) m.branchId=firstBranch; });
   if(!s.debtorAdjustments) s.debtorAdjustments=[];
+  if(!s.bankStatementLines) s.bankStatementLines=[];
+  (s.deposits||[]).forEach(d=>{ if(d.bankConfirmed===undefined) d.bankConfirmed=false; if(d.bankConfirmedDate===undefined) d.bankConfirmedDate=null; });
+  (s.entries||[]).forEach(e=>{ (e.chequeDetails||[]).forEach(cd=>{ if(cd.dishonoured===undefined) cd.dishonoured=false; }); });
   if(!s.users) s.users=[];
   return s;
 }
@@ -1954,7 +2254,19 @@ function modalContent(){
   if(m.type==='chequeDetails') return chequeDetailsModal();
   if(m.type==='chequeView') return chequeViewModal(m.entryId);
   if(m.type==='debtorStatement') return debtorStatementModal(m.customerId);
+  if(m.type==='manualStatementLine') return manualStatementLineModal(m.bankId);
   return '';
+}
+function manualStatementLineModal(bankId){
+  return `<div class="modal" style="max-width:420px;">
+    <div class="modal-head"><h3>Add statement line</h3><button class="close-x" onclick="closeModal()">&times;</button></div>
+    <div class="modal-body">
+      <div class="field"><label>Date</label><input id="mslDate" type="date" value="${todayStr()}"></div>
+      <div class="field"><label>Description</label><input id="mslDesc" placeholder="e.g. Cash deposit branch"></div>
+      <div class="field"><label>Amount</label><input id="mslAmount" type="number" step="0.01"></div>
+    </div>
+    <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveManualStatementLine('${bankId}')">Add line</button></div>
+  </div>`;
 }
 
 function customerModal(d){
@@ -1995,6 +2307,10 @@ function depositModal(d){
         <div class="field check-field" style="align-self:end;"><input type="checkbox" name="verified" ${d.verified?'checked':''}><label>Verified by admin</label></div>
       </div>
       <div class="field"><label>Notes</label><textarea name="notes" rows="2">${esc(d.notes||'')}</textarea></div>
+      <div class="field" style="background:var(--surface-2); border-radius:var(--radius-sm); padding:10px 12px;">
+        <label style="margin-bottom:2px;">Bank statement match</label>
+        <div class="hint">${d.bankConfirmed? `Matched against bank statement${d.bankConfirmedDate? ' · '+fmtDate(d.bankConfirmedDate):''}. Managed from Bank Reconciliation.` : 'Not yet matched to an uploaded bank statement line. Go to Bank Reconciliation to match it.'}</div>
+      </div>
     </form></div>
     <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="saveDepositFromModal()">Save deposit</button></div>
   </div>`;
@@ -2095,8 +2411,8 @@ function chequeViewModal(entryId){
   return `<div class="modal wide">
     <div class="modal-head"><h3>Cheque details — ${fmtDate(e?e.date:'')}</h3><button class="close-x" onclick="closeModal()">&times;</button></div>
     <div class="modal-body"><div class="table-wrap"><table>
-      <thead><tr><th>Date received</th><th>Drawer</th><th>Bank</th><th>Cheque no.</th><th class="right">Amount</th><th>Due date</th><th>Presented</th></tr></thead>
-      <tbody>${details.length? details.map(d=>`<tr><td>${fmtDate(d.receiptDate)}</td><td>${esc(d.drawer)}</td><td>${esc(d.bank)}</td><td class="mono-sm">${esc(d.chequeNumber)}</td><td class="right num">${money(d.amount)}</td><td>${fmtDate(d.dueDate)}</td><td>${d.presented?'<span class="pill pill-green">Yes</span>':'<span class="pill pill-amber">No</span>'}</td></tr>`).join('') : `<tr><td colspan="7" class="empty">No cheque details recorded.</td></tr>`}</tbody>
+      <thead><tr><th>Date received</th><th>Drawer</th><th>Bank</th><th>Cheque no.</th><th class="right">Amount</th><th>Due date</th><th>Status</th></tr></thead>
+      <tbody>${details.length? details.map(d=>`<tr><td>${fmtDate(d.receiptDate)}</td><td>${esc(d.drawer)}</td><td>${esc(d.bank)}</td><td class="mono-sm">${esc(d.chequeNumber)}</td><td class="right num">${money(d.amount)}</td><td>${fmtDate(d.dueDate)}</td><td>${d.dishonoured?'<span class="pill pill-red">Dishonoured</span>':(d.presented?'<span class="pill pill-green">Presented</span>':'<span class="pill pill-amber">Pending</span>')}</td></tr>`).join('') : `<tr><td colspan="7" class="empty">No cheque details recorded.</td></tr>`}</tbody>
     </table></div></div>
     <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Close</button></div>
   </div>`;
