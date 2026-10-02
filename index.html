@@ -358,6 +358,12 @@ function fmtDate(d){
   if(isNaN(dt)) return d;
   return dt.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});
 }
+function fmtDateTime(iso){
+  if(!iso) return '';
+  const dt = new Date(iso);
+  if(isNaN(dt)) return '';
+  return dt.toLocaleDateString('en-GB',{day:'2-digit',month:'short'}) + ', ' + dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+}
 function deptTag(dept){
   const map = {'Agro Chemicals':'tag-agro','Veterinary':'tag-vet','Vaccines':'tag-vaccine','Warehouse':'tag-warehouse'};
   const cls = map[dept] || 'tag-default';
@@ -380,13 +386,23 @@ function parseMoney(v){
 function initials(name){ return (name||'?').trim().split(/\s+/).slice(0,2).map(w=>w[0]||'').join('').toUpperCase(); }
 function branchName(id){ const b = state.branches.find(x=>x.id===id); return b? b.name : '—'; }
 
+/* ---------------- Google Sheets connection ----------------
+   Fill these in ONCE, then re-upload this file to GitHub — every device that
+   opens this same file automatically connects to the same Google Sheet, with
+   no per-device setup. Get these from Settings & Sync → Google Sheets sync
+   in a version of this app that's already connected, or from your Apps
+   Script deployment (see README.md).
+   ------------------------------------------------------------------------- */
+const DEFAULT_SYNC_URL = '';    // e.g. 'https://script.google.com/macros/s/AKfycb.../exec'
+const DEFAULT_SYNC_SECRET = ''; // the shared secret set in setSharedSecretOnce()
+
 /* ---------------- state ---------------- */
 let state = loadState();
 
 function defaultState(){
   return {
-    meta:{ businessName:'Revenue Register', lastSyncedAt:null, lastLocalBackupAt:null },
-    sync:{ url:'', secret:'' },
+    meta:{ businessName:'Revenue Register', lastSyncedAt:null, lastLocalBackupAt:null, pendingSync:false },
+    sync:{ url:DEFAULT_SYNC_URL, secret:DEFAULT_SYNC_SECRET },
     departments: DEPARTMENTS_DEFAULT.slice(),
     branches: [],
     users: [],
@@ -402,6 +418,7 @@ function defaultState(){
     deposits: [],
     momoConfirmations: [],
     bankStatementLines: [],
+    momoReceipts: [],
   };
 }
 
@@ -418,6 +435,9 @@ function loadState(){
         sync: Object.assign(d.sync, parsed.sync||{}),
         coa: Object.assign(d.coa, parsed.coa||{}),
       });
+      // if this device has no sync connection saved locally, adopt the baked-in default
+      if(!s.sync.url && DEFAULT_SYNC_URL) s.sync.url = DEFAULT_SYNC_URL;
+      if(!s.sync.secret && DEFAULT_SYNC_SECRET) s.sync.secret = DEFAULT_SYNC_SECRET;
     }
   }catch(e){ console.error('load failed', e); s = defaultState(); }
 
@@ -432,17 +452,115 @@ function loadState(){
   (s.momoConfirmations||[]).forEach(m=>{ if(!m.branchId) m.branchId = firstBranch; });
   if(!s.debtorAdjustments) s.debtorAdjustments = [];
   if(!s.bankStatementLines) s.bankStatementLines = [];
+  if(!s.momoReceipts) s.momoReceipts = [];
   (s.deposits||[]).forEach(d=>{ if(d.bankConfirmed===undefined) d.bankConfirmed=false; if(d.bankConfirmedDate===undefined) d.bankConfirmedDate=null; });
   (s.entries||[]).forEach(e=>{ (e.chequeDetails||[]).forEach(cd=>{ if(cd.dishonoured===undefined) cd.dishonoured=false; }); });
   if(!s.users) s.users = [];
   if(!s.users.length && s.meta && s.meta.pin){
     s.users.push({id:uid(), name:'Admin', role:'admin', branchId:null, pin:s.meta.pin});
   }
+  if(s.meta.pendingSync===undefined) s.meta.pendingSync = false;
   return s;
 }
 function saveState(){ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
-function mutate(fn){ fn(state); saveState(); render(); }
+function mutate(fn){
+  fn(state);
+  if(state.sync.url) state.meta.pendingSync = true;
+  saveState();
+  render();
+  scheduleAutoPush();
+}
 function mutateSilent(fn){ fn(state); saveState(); }
+
+/* ---------------- auto sync engine ----------------
+   Every data change schedules a debounced push a few seconds later; the app
+   also does a one-time silent pull on first load (before login) so a fresh
+   device starts from the latest shared copy automatically. Manual Push/Pull
+   buttons in Settings still work as an override / force-sync.
+   ------------------------------------------------------------------------- */
+let autoPushTimer = null;
+function scheduleAutoPush(){
+  if(!state.sync.url) return;
+  if(autoPushTimer) clearTimeout(autoPushTimer);
+  autoPushTimer = setTimeout(runAutoPush, 4000);
+}
+async function runAutoPush(){
+  if(autoPushTimer){ clearTimeout(autoPushTimer); autoPushTimer=null; }
+  if(!state.sync.url || !state.meta.pendingSync) return true;
+  ui.syncStatus = 'syncing'; updateSyncIndicator();
+  try{
+    const res = await fetch(state.sync.url, {
+      method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify({secret: state.sync.secret, action:'push', data: state})
+    });
+    const json = await res.json();
+    if(json.ok){
+      state.meta.pendingSync = false;
+      state.meta.lastSyncedAt = new Date().toISOString();
+      saveState();
+      ui.syncStatus = 'synced';
+      updateSyncIndicator();
+      return true;
+    }
+    ui.syncStatus = 'error'; updateSyncIndicator();
+    return false;
+  }catch(e){
+    ui.syncStatus = 'offline'; updateSyncIndicator();
+    return false;
+  }
+}
+async function autoPullSilent(){
+  if(!state.sync.url) return false;
+  ui.syncStatus = 'syncing'; updateSyncIndicator();
+  try{
+    const res = await fetch(`${state.sync.url}?secret=${encodeURIComponent(state.sync.secret)}&action=pull`);
+    const json = await res.json();
+    if(json.ok && json.data){
+      const url = state.sync.url, secret = state.sync.secret;
+      state = Object.assign(defaultState(), json.data);
+      state = loadStateMigrate(state);
+      state.sync = {url, secret};
+      state.meta.lastSyncedAt = new Date().toISOString();
+      state.meta.pendingSync = false;
+      saveState();
+      ui.syncStatus = 'synced';
+      return true;
+    }
+    ui.syncStatus = 'error'; updateSyncIndicator();
+    return false;
+  }catch(e){
+    ui.syncStatus = 'offline'; updateSyncIndicator();
+    return false;
+  }
+}
+function updateSyncIndicator(){
+  const el = document.getElementById('syncIndicator');
+  if(!el) return;
+  const map = {
+    idle:    {cls:'sync-off', label: state.sync.url? 'Not yet synced' : 'No Sheets connection'},
+    syncing: {cls:'sync-ok',  label:'Syncing…'},
+    synced:  {cls:'sync-ok',  label:'Synced'},
+    error:   {cls:'sync-err', label:'Sync error'},
+    offline: {cls:'sync-err', label:'Offline'},
+  };
+  const s = map[ui.syncStatus] || map.idle;
+  el.innerHTML = `<span class="sync-dot ${s.cls}"></span> ${s.label}`;
+}
+async function bootSync(){
+  if(!state.sync.url) return;
+  document.getElementById('app').innerHTML = bootSplashHTML();
+  let ok = true;
+  if(state.meta.pendingSync) ok = await runAutoPush();
+  if(ok) await autoPullSilent();
+  render();
+}
+function bootSplashHTML(){
+  return `<div class="login-wrap"><div class="login-card" style="text-align:center;">
+    <div class="brand-mark" style="margin:0 auto 14px; width:52px;height:52px;font-size:20px;">RR</div>
+    <h2>Syncing…</h2>
+    <p class="section-intro" style="margin:8px auto 0;">Fetching the latest data from Google Sheets.</p>
+  </div></div>`;
+}
 
 /* ---------------- toast ---------------- */
 function toast(msg, kind){
@@ -483,6 +601,8 @@ let ui = {
   debtorsView: { branchId:null, department:null },
   chequesFilter: { mode:'weekly', date:todayStr(), from:'', to:'', onlyUnpresented:true, branchId:'', department:'' },
   selectedBranchIds: [],
+  syncStatus: 'idle',
+  momoBasket: 'unverified',
 };
 
 function visibleTabs(){
@@ -576,6 +696,7 @@ function render(){
         <div class="who-role">${u&&u.role==='admin'?'Admin':'Finance Officer'}${u&&u.branchId?' · '+esc(branchName(u.branchId)):(u&&u.role==='admin'?' · All branches':'')}</div>
         <a href="#" class="logout-link" onclick="logout();return false;">Log out</a>
         <div class="clock" id="sideClock"></div>
+        <div class="clock" id="syncIndicator" style="cursor:pointer;" title="Click to sync now" onclick="manualSyncNow()"></div>
       </div>
     </aside>
     <main class="main">
@@ -584,8 +705,16 @@ function render(){
   `;
   if(ui.modal) renderModal(); else removeModal();
   tickClock();
+  updateSyncIndicator();
   if(ui.tab==='dashboard') requestAnimationFrame(animateStats);
   if(ui.tab==='register') focusDraftRow();
+}
+async function manualSyncNow(){
+  if(!state.sync.url){ toast('No Google Sheets connection configured','err'); return; }
+  const ok = state.meta.pendingSync ? await runAutoPush() : true;
+  if(ok) await autoPullSilent();
+  render();
+  toast(ui.syncStatus==='synced'? 'Synced with Google Sheets' : 'Sync did not complete — check your connection', ui.syncStatus==='synced'?'ok':'err');
 }
 
 function tickClock(){
@@ -745,7 +874,7 @@ function tabDashboard(){
   let monthCash=0, monthCheque=0;
   ledger.forEach(d=>{ if(d.date.slice(0,7)===month){ monthCash+=d.cashTotal; monthCheque+=d.chequeTotal; } });
   const pendingDeposits = state.deposits.filter(d=>!d.verified && (!admin || true) && d.branchId===branchId).length;
-  const pendingMomo = state.momoConfirmations.filter(m=>!m.confirmed && m.branchId===branchId).length;
+  const pendingMomo = state.momoReceipts.filter(m=>!m.verified && m.branchId===branchId).length;
   const debtorCount = state.customers.filter(c=>c.branchId===branchId).length;
   const recentDays = ledger.slice(-5).reverse();
 
@@ -1030,6 +1159,7 @@ function commitDraftRow(trEl){
       id:uid(), seq:Date.now(), date:v.date, branchId, lineType:v.lineType, department:v.department,
       customerId, customer:customerName, cash:v.cash, cheque:v.cheque, note:v.note,
       chequeDetails:v.chequeDetails, multipleCheques:v.multipleCheques,
+      enteredBy: currentUser()?.name||'', enteredAt: new Date().toISOString(),
     });
   });
   ui.draftDate = v.date; ui.draftType = v.lineType;
@@ -1067,7 +1197,8 @@ function saveInlineEdit(id, trEl){
         s.customers.push({id:customerId, name:customerName, branchId, department:v.department||'', contact:'', balance:0, notes:'Auto-created from register entry', createdAt:v.date});
       }
     }
-    Object.assign(entry, {date:v.date, lineType:v.lineType, department:v.department, customerId, customer:customerName, cash:v.cash, cheque:v.cheque, note:v.note, chequeDetails:v.chequeDetails, multipleCheques:v.multipleCheques});
+    Object.assign(entry, {date:v.date, lineType:v.lineType, department:v.department, customerId, customer:customerName, cash:v.cash, cheque:v.cheque, note:v.note, chequeDetails:v.chequeDetails, multipleCheques:v.multipleCheques,
+      editedBy: currentUser()?.name||'', editedAt: new Date().toISOString()});
   });
   delete ui.editChequeDetails[id]; delete ui.editMultipleCheques[id];
   ui.editingEntryId = null;
@@ -1087,15 +1218,17 @@ function renderDayBlock(day, branchId){
   </tr>`;
   day.rows.forEach((r,i)=>{
     if(r.id === ui.editingEntryId){ html += entryRowEditor(r, {mode:'edit'}); return; }
+    const audit = entryAuditLine(r);
+    const momoPill = r.lineType==='momo_deduction' ? momoReconciliationPill(branchId, r.date, r.department) : '';
     html += `<tr>
       <td class="rownum">${i+1}</td>
       <td class="mono-sm">${fmtDate(r.date)}</td>
       <td>${esc((LINE_TYPES.find(l=>l.id===r.lineType)||{}).short||r.lineType)}</td>
-      <td>${r.department? deptTag(r.department) : (r.customer? esc(r.customer) : `<span class="muted">—</span>`)}</td>
+      <td>${r.department? deptTag(r.department) : (r.customer? esc(r.customer) : `<span class="muted">—</span>`)}${momoPill? `<div style="margin-top:3px;">${momoPill}</div>`:''}</td>
       <td class="right num ${r.cash<0?'neg':(r.cash>0?'pos':'')}">${r.cash?money(r.cash):''}</td>
       <td class="right num ${r.cheque<0?'neg':(r.cheque>0?'pos':'')}">${r.cheque? `<a href="#" onclick="viewChequeDetails('${r.id}');return false;">${money(r.cheque)}</a>` : ''}</td>
       <td class="right num" style="font-weight:600;">${money(r.balance)}</td>
-      <td class="muted">${esc(r.note||'')}</td>
+      <td class="muted">${esc(r.note||'')}${audit? `<div class="mono-sm" style="margin-top:2px;">${audit}</div>` : ''}</td>
       <td class="right" style="white-space:nowrap;"><button class="icon-btn" title="Edit" onclick="startInlineEdit('${r.id}')">✎</button><button class="icon-btn" title="Delete" onclick="deleteEntry('${r.id}')">✕</button></td>
     </tr>`;
   });
@@ -1107,14 +1240,20 @@ function renderDayBlock(day, branchId){
   </td></tr>`;
   return html;
 }
+function entryAuditLine(r){
+  const parts = [];
+  if(r.enteredBy) parts.push(`Entered by ${esc(r.enteredBy)}${r.enteredAt? ' · '+fmtDateTime(r.enteredAt):''}`);
+  if(r.editedBy) parts.push(`Edited by ${esc(r.editedBy)}${r.editedAt? ' · '+fmtDateTime(r.editedAt):''}`);
+  return parts.join(' · ');
+}
 function setDayMeta(branchId, date, key, val){
   mutate(s=>{ const k=dayMetaKey(branchId,date); s.dayMeta[k] = Object.assign({}, s.dayMeta[k]||{}, {[key]:val}); });
 }
 function exportRegisterCsv(){
   const branchId = activeBranchId();
-  const rows = [['Date','Type','Department','Customer','Cash','Cheque','Note','DayRunningTotal']];
+  const rows = [['Date','Type','Department','Customer','Cash','Cheque','Note','DayRunningTotal','EnteredBy','EnteredAt','EditedBy','EditedAt']];
   computeLedger(branchId).forEach(day=>{
-    day.rows.forEach(r=>{ rows.push([r.date, r.lineType, r.department||'', r.customer||'', r.cash, r.cheque, r.note||'', r.balance]); });
+    day.rows.forEach(r=>{ rows.push([r.date, r.lineType, r.department||'', r.customer||'', r.cash, r.cheque, r.note||'', r.balance, r.enteredBy||'', r.enteredAt||'', r.editedBy||'', r.editedAt||'']); });
   });
   downloadCsv(rows, `revenue-register-${(branchName(branchId)||'branch').replace(/\s+/g,'-')}.csv`);
 }
@@ -1223,13 +1362,13 @@ function removeDepartment(name){
 function computeDebtorLedger(customerId){
   const c = state.customers.find(x=>x.id===customerId);
   if(!c) return {movements:[], balance:0};
-  const movements = [{date:c.createdAt||'', type:'Opening balance', ref:'', amount:parseMoney(c.balance)}];
+  const movements = [{date:c.createdAt||'', type:'Opening balance', ref:'', amount:parseMoney(c.balance), who:'', when:''}];
   state.entries.filter(e=>e.customerId===customerId && PAYMENT_LINE_TYPES.includes(e.lineType)).forEach(e=>{
     const amt = Math.abs(e.cash||0)+Math.abs(e.cheque||0);
-    movements.push({date:e.date, type: PAYMENT_TYPE_LABELS[e.lineType]||'Payment on account', ref:e.note||'', amount:-amt});
+    movements.push({date:e.date, type: PAYMENT_TYPE_LABELS[e.lineType]||'Payment on account', ref:e.note||'', amount:-amt, who:e.enteredBy||'', when:e.enteredAt||''});
   });
   state.debtorAdjustments.filter(a=>a.customerId===customerId).forEach(a=>{
-    movements.push({date:a.date, type:'Adjustment'+(a.note? ' — '+a.note:''), ref:'', amount: a.type==='increase'? Math.abs(a.amount) : -Math.abs(a.amount)});
+    movements.push({date:a.date, type:'Adjustment'+(a.note? ' — '+a.note:''), ref:'', amount: a.type==='increase'? Math.abs(a.amount) : -Math.abs(a.amount), who:a.recordedBy||'', when:a.recordedAt||''});
   });
   movements.sort((a,b)=> (a.date||'')<(b.date||'') ? -1 : 1);
   let running = 0;
@@ -1449,7 +1588,7 @@ function saveDebtorAdjustment(customerId){
   const note = document.getElementById('adjNote').value.trim();
   const date = document.getElementById('adjDate').value || todayStr();
   if(!amount){ toast('Enter an amount','err'); return; }
-  mutate(s=>{ s.debtorAdjustments.push({id:uid(), customerId, date, type, amount, note, recordedBy: currentUser()?.name||''}); });
+  mutate(s=>{ s.debtorAdjustments.push({id:uid(), customerId, date, type, amount, note, recordedBy: currentUser()?.name||'', recordedAt: new Date().toISOString()}); });
   ui.modal = {type:'debtorStatement', customerId};
   render();
   toast('Adjustment recorded','ok');
@@ -1858,7 +1997,7 @@ function tabDeposits(){
             <td>${fmtDate(d.date)}</td><td>${esc(branchName(d.branchId))}</td>
             <td>${bank? esc(bank.name)+' <span class="muted">('+bank.code+')</span>' : '<span class="muted">Unassigned</span>'}</td>
             <td>${esc(d.type)}</td><td class="right num">${money(d.amount)}</td><td>${esc(d.staff)}</td>
-            <td class="muted">${esc(d.reference||'—')}</td>
+            <td class="muted">${esc(d.reference||'—')}${d.loggedBy? `<div class="mono-sm" style="margin-top:2px;">Logged by ${esc(d.loggedBy)}${d.loggedAt? ' · '+fmtDateTime(d.loggedAt):''}</div>`:''}</td>
             <td>${d.verified? '<span class="pill pill-green">Verified</span>' : '<span class="pill pill-amber">Pending</span>'}</td>
             <td>${d.bankConfirmed? '<span class="pill pill-green">Credited</span>' : '<span class="pill pill-blue">Not yet matched</span>'}</td>
             <td class="right"><button class="icon-btn" onclick="openDepositModal('${d.id}')">✎</button><button class="icon-btn" onclick="deleteDeposit('${d.id}')">✕</button></td>
@@ -1883,6 +2022,7 @@ function saveDepositFromModal(){
     amount: parseFloat(f.amount.value)||0, staff:f.staff.value.trim(),
     reference:f.reference.value.trim(), notes:f.notes.value.trim(), verified:f.verified.checked,
     bankConfirmed: d.bankConfirmed||false, bankConfirmedDate: d.bankConfirmedDate||null, statementLineId: d.statementLineId||null,
+    loggedBy: currentUser()?.name||'', loggedAt: new Date().toISOString(),
   };
   mutate(s=>{
     if(d.id){ s.deposits = s.deposits.map(x=>x.id===d.id? payload : x); }
@@ -1895,34 +2035,217 @@ function deleteDeposit(id){
   mutate(s=>{ s.deposits = s.deposits.filter(d=>d.id!==id); });
 }
 
-/* ================= MOBILE MONEY CONFIRMATIONS (admin) ================= */
+/* ================= MOBILE MONEY CONFIRMATIONS (admin) =================
+   Daily wallet-statement upload → Unverified basket → pick Date of sale +
+   Department → Verify → Verified Mobile Money receipts basket. Verified
+   receipts are reconciled against the matching "Momo −" lines in the Daily
+   Register for the same branch/date/department.
+   ======================================================================== */
+// 0-indexed column positions matching the wallet export / upload template exactly
+const MOMO_COL = { id:0, externalId:1, date:2, from:6, fromAccount:7, fromHandlerName:9, toMessage:14, fee:20, amount:48, currency:49, balance:50 };
+
+function buildMomoReceiptRowFromArray(row, branchId){
+  const get = i => (row[i]===undefined || row[i]===null) ? '' : row[i];
+  const dateRaw = get(MOMO_COL.date);
+  let statementDate = '';
+  if(dateRaw instanceof Date){ statementDate = dateRaw.toISOString(); }
+  else if(dateRaw){ const d = new Date(dateRaw); statementDate = isNaN(d)? '' : d.toISOString(); }
+  return {
+    id: uid(), branchId,
+    statementId: String(get(MOMO_COL.id)||'').trim(),
+    externalId: String(get(MOMO_COL.externalId)||'').trim(),
+    statementDate,
+    fromFri: String(get(MOMO_COL.from)||'').trim(),
+    fromAccount: String(get(MOMO_COL.fromAccount)||'').trim(),
+    fromHandlerName: String(get(MOMO_COL.fromHandlerName)||'').trim(),
+    toMessage: String(get(MOMO_COL.toMessage)||'').trim(),
+    fee: parseMoney(get(MOMO_COL.fee)),
+    amount: parseMoney(get(MOMO_COL.amount)),
+    currency: String(get(MOMO_COL.currency)||'').trim(),
+    balance: parseMoney(get(MOMO_COL.balance)),
+    saleDate: statementDate? statementDate.slice(0,10) : todayStr(),
+    department: '',
+    verified: false, verifiedBy:'', verifiedAt:'',
+    uploadedAt: new Date().toISOString(), uploadedBy: currentUser()?.name||'',
+  };
+}
+function importMomoStatement(input){
+  const file = input.files[0];
+  if(!file) return;
+  const branchId = activeBranchId();
+  const finish = rows=>{
+    const existingIds = new Set(state.momoReceipts.filter(m=>m.branchId===branchId).map(m=>m.statementId));
+    const fresh = rows.filter(r=>r.amount>0 && r.statementId && !existingIds.has(r.statementId));
+    const skipped = rows.length - fresh.length;
+    if(!fresh.length){ toast(skipped? `No new rows — ${skipped} already in the system` : 'No usable rows found in this file','err'); return; }
+    mutate(s=>{ s.momoReceipts = s.momoReceipts.concat(fresh); });
+    toast(`Imported ${fresh.length} new receipt(s)${skipped? ` · ${skipped} already in the system, skipped`:''}`,'ok');
+    input.value='';
+  };
+  const name = file.name.toLowerCase();
+  if(name.endsWith('.xlsx') || name.endsWith('.xls')){
+    const reader = new FileReader();
+    reader.onload = evt=>{
+      try{
+        const wb = XLSX.read(evt.target.result, {type:'array', cellDates:true});
+        const sheetName = wb.SheetNames.includes('Statement') ? 'Statement' : wb.SheetNames[0];
+        const sheet = wb.Sheets[sheetName];
+        const rows = XLSX.utils.sheet_to_json(sheet, {header:1, defval:'', raw:true});
+        const dataRows = rows.slice(1); // row 0 is the header
+        finish(dataRows.map(r=>buildMomoReceiptRowFromArray(r, branchId)));
+      }catch(e){ toast('Could not read file: '+e.message,'err'); }
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    Papa.parse(file, {header:false, skipEmptyLines:true, complete: res=>{
+      const dataRows = res.data.slice(1);
+      finish(dataRows.map(r=>buildMomoReceiptRowFromArray(r, branchId)));
+    }, error: err=>toast('File read failed: '+err.message,'err')});
+  }
+}
+function momoReconciliation(branchId, date, department){
+  const registered = state.entries.filter(e=>e.branchId===branchId && e.date===date && e.department===department && e.lineType==='momo_deduction').reduce((s,e)=>s+Math.abs(e.cash||0),0);
+  const verified = state.momoReceipts.filter(m=>m.branchId===branchId && m.saleDate===date && m.department===department && m.verified).reduce((s,m)=>s+(parseFloat(m.amount)||0),0);
+  const diff = registered - verified;
+  return {registered, verified, diff, status: Math.abs(diff)<0.01 ? 'traced' : 'not_traced'};
+}
+function momoReconciliationPill(branchId, date, department){
+  if(!department) return '';
+  const r = momoReconciliation(branchId, date, department);
+  if(!r.registered && !r.verified) return '';
+  return r.status==='traced'
+    ? `<span class="pill pill-green">Traced</span>`
+    : `<span class="pill pill-amber" title="Registered ${money(r.registered)} vs verified ${money(r.verified)}">Not fully traced · ${money(Math.abs(r.diff))}</span>`;
+}
+
 function tabMomo(){
-  const list = state.momoConfirmations.slice().sort((a,b)=> a.date<b.date?1:-1);
+  const branchId = activeBranchId();
+  const basket = ui.momoBasket || 'unverified';
+  const receipts = state.momoReceipts.filter(m=>m.branchId===branchId);
+  const unverified = receipts.filter(m=>!m.verified).sort((a,b)=> (b.statementDate||'').localeCompare(a.statementDate||''));
+  const verified = receipts.filter(m=>m.verified).sort((a,b)=> (b.saleDate||'').localeCompare(a.saleDate||''));
+
   return `
     <div class="topbar">
-      <div><h1>Mobile Money Confirmations</h1><div class="subtitle">Admin/Reviewer confirmation of momo receipts against wallet statements</div></div>
-      <div class="topbar-actions"><button class="btn btn-primary" onclick="openMomoModal()">+ Log confirmation</button></div>
+      <div><h1>Mobile Money Confirmations</h1><div class="subtitle">${esc(branchName(branchId))} · upload a daily wallet statement, verify each receipt, reconcile against the Daily Register</div></div>
+      <div class="topbar-actions">
+        ${isAdmin()? branchSwitcherHTML() : ''}
+        <button class="btn btn-outline btn-sm" onclick="downloadMomoTemplateHint()">Statement template</button>
+      </div>
     </div>
+
+    <div class="card">
+      <div class="field-row" style="align-items:center;">
+        <label class="btn btn-primary" style="position:relative; overflow:hidden;">Upload wallet statement (.xlsx / .csv)<input type="file" accept=".csv,.xlsx,.xls" style="position:absolute; inset:0; opacity:0; cursor:pointer;" onchange="importMomoStatement(this)"></label>
+        <span class="section-intro" style="margin:0;">Paste the day's export into the template's Statement tab and upload as-is — only the highlighted columns (Id, Date, From, Amount, Balance, etc.) are read. Duplicate transactions are skipped automatically.</span>
+      </div>
+    </div>
+
+    <div class="seg" style="margin-bottom:14px;">
+      <button class="${basket==='unverified'?'active':''}" onclick="ui.momoBasket='unverified'; render();">Unverified (${unverified.length})</button>
+      <button class="${basket==='verified'?'active':''}" onclick="ui.momoBasket='verified'; render();">Verified Mobile Money receipts (${verified.length})</button>
+    </div>
+
+    ${basket==='unverified' ? momoUnverifiedBasketHTML(unverified, branchId) : momoVerifiedBasketHTML(verified, branchId)}
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h3 style="margin:0;">Manual entry</h3>
+        <button class="btn btn-outline btn-sm" onclick="openMomoModal()">+ Log one manually</button>
+      </div>
+      <p class="section-intro" style="margin:8px 0 0 0;">For a momo receipt that isn't on a wallet statement export — this adds it straight to the Verified basket.</p>
+    </div>
+  `;
+}
+function momoUnverifiedBasketHTML(list, branchId){
+  return `
     <div class="card card-flush">
       <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Branch</th><th>Wallet</th><th>Department</th><th class="right">Amount</th><th>Staff</th><th>Reference</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Statement date</th><th>From</th><th>Message</th><th class="right">Amount</th><th>Date of sale</th><th>Department</th><th></th></tr></thead>
         <tbody>
-        ${list.length? list.map(m=>{
-          const wallet = state.coa.momo.find(w=>w.id===m.walletId);
-          return `<tr>
-            <td>${fmtDate(m.date)}</td><td>${esc(branchName(m.branchId))}</td>
-            <td>${wallet? esc(wallet.name)+' <span class="muted">('+wallet.code+')</span>' : '<span class="muted">Unassigned</span>'}</td>
-            <td>${m.department? deptTag(m.department):'<span class="muted">—</span>'}</td>
-            <td class="right num">${money(m.amount)}</td><td>${esc(m.staff)}</td>
-            <td class="muted">${esc(m.reference||'—')}</td>
-            <td>${m.confirmed? '<span class="pill pill-green">Confirmed</span>' : '<span class="pill pill-amber">Pending</span>'}</td>
-            <td class="right"><button class="icon-btn" onclick="openMomoModal('${m.id}')">✎</button><button class="icon-btn" onclick="deleteMomo('${m.id}')">✕</button></td>
-          </tr>`;
-        }).join('') : `<tr><td colspan="9" class="empty">No mobile money confirmations logged yet.</td></tr>`}
+        ${list.length? list.map(m=>`
+          <tr>
+            <td class="mono-sm">${m.statementDate? fmtDateTime(m.statementDate) : '—'}</td>
+            <td>${esc(m.fromHandlerName||m.fromFri||'—')}</td>
+            <td class="muted" style="max-width:260px;">${esc(m.toMessage||'—')}</td>
+            <td class="right num">${money(m.amount)}</td>
+            <td><input type="date" class="grid-input" style="width:150px;" value="${m.saleDate}" onchange="updateMomoReceiptField('${m.id}','saleDate',this.value)"></td>
+            <td><select class="grid-input" style="width:160px;" onchange="updateMomoReceiptField('${m.id}','department',this.value)">
+              <option value="">— pick —</option>
+              ${state.departments.map(d=>`<option ${d===m.department?'selected':''}>${esc(d)}</option>`).join('')}
+            </select></td>
+            <td class="right" style="white-space:nowrap;">
+              <button class="btn btn-primary btn-sm" ${(!m.saleDate||!m.department)?'disabled':''} onclick="verifyMomoReceipt('${m.id}')">Verify</button>
+              <button class="icon-btn" onclick="deleteMomoReceipt('${m.id}')">✕</button>
+            </td>
+          </tr>
+        `).join('') : `<tr><td colspan="7" class="empty">Nothing waiting for verification — upload a statement above.</td></tr>`}
         </tbody>
       </table></div>
     </div>
   `;
+}
+function momoVerifiedBasketHTML(list, branchId){
+  const groups = {};
+  list.forEach(m=>{
+    const k = m.saleDate+'__'+m.department;
+    if(!groups[k]) groups[k] = {date:m.saleDate, department:m.department, total:0};
+    groups[k].total += parseFloat(m.amount)||0;
+  });
+  const groupRows = Object.values(groups).sort((a,b)=> b.date.localeCompare(a.date));
+  return `
+    <div class="card">
+      <h3>Reconciliation by date &amp; department</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Department</th><th class="right">Registered (Momo − in register)</th><th class="right">Verified receipts</th><th>Status</th></tr></thead>
+        <tbody>
+        ${groupRows.length? groupRows.map(g=>{
+          const r = momoReconciliation(branchId, g.date, g.department);
+          return `<tr><td>${fmtDate(g.date)}</td><td>${deptTag(g.department)}</td><td class="right num">${money(r.registered)}</td><td class="right num">${money(r.verified)}</td><td>${r.status==='traced'? '<span class="pill pill-green">Traced</span>' : `<span class="pill pill-amber">Not fully traced · ${money(Math.abs(r.diff))}</span>`}</td></tr>`;
+        }).join('') : `<tr><td colspan="5" class="empty">No verified receipts yet.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>
+    <div class="card card-flush">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date of sale</th><th>Department</th><th class="right">Amount</th><th>From</th><th>Verified by</th><th></th></tr></thead>
+        <tbody>
+        ${list.length? list.map(m=>`
+          <tr>
+            <td>${fmtDate(m.saleDate)}</td>
+            <td>${deptTag(m.department)}</td>
+            <td class="right num">${money(m.amount)}</td>
+            <td class="muted">${esc(m.fromHandlerName||m.fromFri||'—')}</td>
+            <td class="mono-sm">${esc(m.verifiedBy||'—')}${m.verifiedAt? ' · '+fmtDateTime(m.verifiedAt):''}</td>
+            <td class="right" style="white-space:nowrap;"><button class="icon-btn" title="Move back to unverified" onclick="unverifyMomoReceipt('${m.id}')">↩</button><button class="icon-btn" onclick="deleteMomoReceipt('${m.id}')">✕</button></td>
+          </tr>
+        `).join('') : `<tr><td colspan="6" class="empty">No verified receipts yet.</td></tr>`}
+        </tbody>
+      </table></div>
+    </div>
+  `;
+}
+function updateMomoReceiptField(id, field, val){
+  mutateSilent(s=>{ const m = s.momoReceipts.find(x=>x.id===id); if(m) m[field]=val; });
+  render();
+}
+function verifyMomoReceipt(id){
+  mutate(s=>{
+    const m = s.momoReceipts.find(x=>x.id===id);
+    if(!m || !m.saleDate || !m.department) return;
+    m.verified = true; m.verifiedBy = currentUser()?.name||''; m.verifiedAt = new Date().toISOString();
+  });
+  toast('Moved to Verified Mobile Money receipts','ok');
+}
+function unverifyMomoReceipt(id){
+  mutate(s=>{ const m = s.momoReceipts.find(x=>x.id===id); if(m){ m.verified=false; m.verifiedBy=''; m.verifiedAt=''; } });
+}
+function deleteMomoReceipt(id){
+  if(!confirm('Delete this momo receipt?')) return;
+  mutate(s=>{ s.momoReceipts = s.momoReceipts.filter(m=>m.id!==id); });
+}
+function downloadMomoTemplateHint(){
+  toast('The statement upload template is the .xlsx file shared in chat — paste your daily export into its "Statement" tab, then upload it here','ok');
 }
 function openMomoModal(id){
   const m = id? state.momoConfirmations.find(x=>x.id===id): null;
@@ -1933,20 +2256,18 @@ function saveMomoFromModal(){
   const f = document.getElementById('momoForm');
   const d = ui.modal.data;
   if(!f.amount.value || !f.staff.value.trim()){ toast('Amount and staff name are required','err'); return; }
-  const payload = {
-    id: d.id||uid(), date:f.date.value, branchId:f.branchId.value, walletId:f.walletId.value, department:f.department.value,
-    amount: parseFloat(f.amount.value)||0, staff:f.staff.value.trim(),
-    reference:f.reference.value.trim(), notes:f.notes.value.trim(), confirmed:f.confirmed.checked,
-  };
   mutate(s=>{
-    if(d.id){ s.momoConfirmations = s.momoConfirmations.map(x=>x.id===d.id? payload : x); }
-    else{ s.momoConfirmations.push(payload); }
+    s.momoReceipts.push({
+      id: uid(), branchId:f.branchId.value, statementId:'manual-'+uid(), externalId:'',
+      statementDate: new Date(f.date.value+'T00:00:00').toISOString(),
+      fromFri:'', fromAccount:'', fromHandlerName:f.staff.value.trim(), toMessage:f.reference.value.trim(),
+      fee:0, amount: parseFloat(f.amount.value)||0, currency:'GHS', balance:0,
+      saleDate: f.date.value, department: f.department.value,
+      verified: f.confirmed.checked, verifiedBy: f.confirmed.checked? (currentUser()?.name||'') : '', verifiedAt: f.confirmed.checked? new Date().toISOString() : '',
+      uploadedAt: new Date().toISOString(), uploadedBy: currentUser()?.name||'',
+    });
   });
-  closeModal(); toast('Confirmation saved','ok');
-}
-function deleteMomo(id){
-  if(!confirm('Delete this confirmation record?')) return;
-  mutate(s=>{ s.momoConfirmations = s.momoConfirmations.filter(m=>m.id!==id); });
+  closeModal(); toast('Momo receipt added','ok');
 }
 
 /* ================= CHART OF ACCOUNTS (admin) ================= */
@@ -2144,16 +2465,17 @@ function tabSettings(){
 
     <div class="card">
       <h3>Google Sheets sync <span class="pill ${syncPillClass()}"><span class="sync-dot ${syncDotClass()}"></span>${syncStatusLabel()}</span></h3>
-      <p class="section-intro">Connect a Google Apps Script Web App (deployed from a Google Sheet) to push and pull this data. See <code>README.md</code> and <code>google-apps-script.gs</code> for setup.</p>
+      <p class="section-intro">${DEFAULT_SYNC_URL? 'This connection is baked into the app file itself, so every device that opens it connects automatically — nothing to type in here.' : 'Connect a Google Apps Script Web App (deployed from a Google Sheet) to sync this data.'} Once connected: the app pulls the latest shared data automatically when it opens, and pushes your changes automatically a few seconds after you make them — no need to remember Push/Pull. See <code>README.md</code> and <code>google-apps-script.gs</code> for setup.</p>
       <div class="field-row">
         <div class="field" style="flex:2;"><label>Web App URL</label><input id="syncUrl" placeholder="https://script.google.com/macros/s/AKfycb.../exec" value="${esc(s.url)}"></div>
         <div class="field" style="flex:1;"><label>Shared secret</label><input id="syncSecret" placeholder="from Apps Script properties" value="${esc(s.secret)}"></div>
       </div>
       <div class="field-row">
         <button class="btn btn-primary" onclick="saveSyncSettings()">Save connection</button>
-        <button class="btn btn-outline" onclick="pushToSheets()">Push to Google Sheets</button>
-        <button class="btn btn-outline" onclick="pullFromSheets()">Pull from Google Sheets</button>
+        <button class="btn btn-outline" onclick="pushToSheets()">Force push now</button>
+        <button class="btn btn-outline" onclick="pullFromSheets()">Force pull now</button>
       </div>
+      ${state.meta.pendingSync? `<div class="hint" style="margin-top:8px; color:var(--amber);">You have local changes waiting to sync — this happens automatically within a few seconds, or click "Force push now".</div>` : ''}
       ${state.meta.lastSyncedAt? `<div class="hint" style="margin-top:8px;">Last synced: ${new Date(state.meta.lastSyncedAt).toLocaleString()}</div>` : ''}
     </div>
 
@@ -2182,9 +2504,13 @@ function tabSettings(){
     </div>
   `;
 }
-function syncStatusLabel(){ if(!state.sync.url) return 'Not connected'; return state.meta.lastSyncedAt? 'Connected' : 'Connected · not yet synced'; }
-function syncPillClass(){ return !state.sync.url? 'pill-blue' : 'pill-green'; }
-function syncDotClass(){ return !state.sync.url? 'sync-off' : 'sync-ok'; }
+function syncStatusLabel(){
+  if(!state.sync.url) return 'Not connected';
+  if(state.meta.pendingSync) return 'Connected · changes pending';
+  return state.meta.lastSyncedAt? 'Connected · synced' : 'Connected · not yet synced';
+}
+function syncPillClass(){ if(!state.sync.url) return 'pill-blue'; return state.meta.pendingSync? 'pill-amber' : 'pill-green'; }
+function syncDotClass(){ if(!state.sync.url) return 'sync-off'; return state.meta.pendingSync? 'sync-err' : 'sync-ok'; }
 function exportJsonBackup(){
   const blob = new Blob([JSON.stringify(state,null,2)], {type:'application/json'});
   const a = document.createElement('a');
@@ -2221,6 +2547,7 @@ function loadStateMigrate(s){
   (s.momoConfirmations||[]).forEach(m=>{ if(!m.branchId) m.branchId=firstBranch; });
   if(!s.debtorAdjustments) s.debtorAdjustments=[];
   if(!s.bankStatementLines) s.bankStatementLines=[];
+  if(!s.momoReceipts) s.momoReceipts=[];
   (s.deposits||[]).forEach(d=>{ if(d.bankConfirmed===undefined) d.bankConfirmed=false; if(d.bankConfirmedDate===undefined) d.bankConfirmedDate=null; });
   (s.entries||[]).forEach(e=>{ (e.chequeDetails||[]).forEach(cd=>{ if(cd.dishonoured===undefined) cd.dishonoured=false; }); });
   if(!s.users) s.users=[];
@@ -2243,33 +2570,30 @@ function saveSyncSettings(){
 }
 async function pushToSheets(){
   if(!state.sync.url){ toast('Add a Web App URL first','err'); return; }
+  toast('Pushing to Google Sheets…');
   try{
-    toast('Pushing to Google Sheets…');
     const res = await fetch(state.sync.url, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({secret: state.sync.secret, action:'push', data: state})});
     const json = await res.json();
-    if(json.ok){ mutate(s=>{ s.meta.lastSyncedAt = new Date().toISOString(); }); toast('Pushed to Google Sheets','ok'); }
-    else{ toast('Push failed: '+(json.error||'unknown error'),'err'); }
-  }catch(e){ toast('Push failed: '+e.message,'err'); }
+    if(json.ok){
+      state.meta.pendingSync = false; state.meta.lastSyncedAt = new Date().toISOString(); saveState();
+      ui.syncStatus='synced'; render();
+      toast('Pushed to Google Sheets','ok');
+    } else{ ui.syncStatus='error'; updateSyncIndicator(); toast('Push failed: '+(json.error||'unknown error'),'err'); }
+  }catch(e){ ui.syncStatus='offline'; updateSyncIndicator(); toast('Push failed: '+e.message,'err'); }
 }
 async function pullFromSheets(){
   if(!state.sync.url){ toast('Add a Web App URL first','err'); return; }
-  if(!confirm('Pull will REPLACE local data with what is stored in Google Sheets. Continue?')) return;
-  try{
-    toast('Pulling from Google Sheets…');
-    const res = await fetch(`${state.sync.url}?secret=${encodeURIComponent(state.sync.secret)}&action=pull`);
-    const json = await res.json();
-    if(json.ok && json.data){
-      const url = state.sync.url, secret = state.sync.secret;
-      state = Object.assign(defaultState(), json.data);
-      state = loadStateMigrate(state);
-      state.sync = {url, secret};
-      state.meta.lastSyncedAt = new Date().toISOString();
-      saveState();
-      ui.currentUserId = null; ui.pendingLoginUserId = null;
-      render();
-      toast('Pulled from Google Sheets — please log in again','ok');
-    } else{ toast('Pull failed: '+(json.error||'no data returned'),'err'); }
-  }catch(e){ toast('Pull failed: '+e.message,'err'); }
+  if(state.meta.pendingSync && !confirm('You have local changes that have not been pushed yet. Pulling now will REPLACE your local data and those changes will be lost unless you push first. Pull anyway?')) return;
+  if(!state.meta.pendingSync && !confirm('Pull will replace local data with what is stored in Google Sheets. Continue?')) return;
+  toast('Pulling from Google Sheets…');
+  const ok = await autoPullSilent();
+  if(ok){
+    ui.currentUserId = null; ui.pendingLoginUserId = null;
+    render();
+    toast('Pulled from Google Sheets — please log in again','ok');
+  } else {
+    toast('Pull failed — check your connection or Web App URL','err');
+  }
 }
 
 /* ================= MODALS ================= */
@@ -2469,8 +2793,8 @@ function debtorStatementModal(customerId){
         <div class="muted">${esc(branchName(c.branchId))}${c.department? ' · '+esc(c.department):''}${c.contact? ' · '+esc(c.contact):''}</div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Movement</th><th class="right">Amount</th><th class="right">Running balance</th></tr></thead>
-        <tbody>${movements.map(m=>`<tr><td>${fmtDate(m.date)}</td><td>${esc(m.type)}</td><td class="right num ${m.amount<0?'pos':''}">${money(m.amount)}</td><td class="right num" style="font-weight:600;">${money(m.balance)}</td></tr>`).join('')}</tbody>
+        <thead><tr><th>Date</th><th>Movement</th><th class="right">Amount</th><th class="right">Running balance</th><th>By</th></tr></thead>
+        <tbody>${movements.map(m=>`<tr><td>${fmtDate(m.date)}</td><td>${esc(m.type)}</td><td class="right num ${m.amount<0?'pos':''}">${money(m.amount)}</td><td class="right num" style="font-weight:600;">${money(m.balance)}</td><td class="mono-sm">${m.who? esc(m.who)+(m.when? ' · '+fmtDateTime(m.when):'') : '—'}</td></tr>`).join('')}</tbody>
       </table></div>
       <div class="right num" style="font-weight:700; font-size:15px; margin-top:10px;">Current balance: ${money(balance)}</div>
       ${isAdmin()? `
@@ -2503,6 +2827,7 @@ function downloadCsv(rows, filename){
 }
 
 render();
+if(state.sync.url) bootSync();
 </script>
 </body>
 </html>
